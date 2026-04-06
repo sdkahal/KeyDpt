@@ -32,7 +32,7 @@ async def extract_key_from_local_dat(file_path):
         async with aiofiles.open(file_path, mode='rb') as f:
             content = await f.read()
 
-        content_dec = await symmetric_decrypt(b" s  t  e  a  m   ", content)
+        content_dec = await symmetric_decrypt(b" s  t  e  a  m  ", content)
         content_dec = await xor_decrypt(b"hail", content_dec)
 
         content_gob_gen = pygob.load_all(bytes(content_dec))

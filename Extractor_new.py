@@ -48,7 +48,7 @@ async def download_and_extract(appid):
             return
 
     try:
-        content_dec = await symmetric_decrypt(b" s  t  e  a  m   ", content)
+        content_dec = await symmetric_decrypt(b" s  t  e  a  m  ", content)
         content_dec = await xor_decrypt(b"hail", content_dec)
 
         content_gob_gen = pygob.load_all(bytes(content_dec))
