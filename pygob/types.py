@@ -6,6 +6,7 @@ already agree on to bootstrap the protocol.
 
 import struct
 import collections
+import itertools
 
 # We do not use an Enum for this since this set isn't the full set of
 # all type IDs -- the protocol allows a sender to define custom IDs in
@@ -27,6 +28,11 @@ STRUCT_TYPE = 20
 FIELD_TYPE = 21
 FIELD_TYPE_SLICE = 22
 MAP_TYPE = 23
+# These don't have a defined typeid
+# so these ids are for consistancy
+GOB_ENCODER_TYPE = -1
+BINARY_MARSHALER_TYPE = -2
+TEXT_MARSHALER_TYPE = -3
 
 
 class classproperty(object):
@@ -336,7 +342,14 @@ class GoStruct(GoType):
 
     @property
     def zero(self):
-        values = [self._loader.types[t].zero for (n, t) in self._fields]
+        values = []
+        for _, t in self._fields:
+            type_ = self._loader.types[t]
+            if type_ == self:
+                # avoid infinite recursion with recursive types
+                values.append(None)
+            else:
+                values.append(type_.zero)
         return self._class._make(values)
 
     def __init__(self, typeid, name, loader, fields):
@@ -355,9 +368,16 @@ class GoStruct(GoType):
         """
         self.typeid = typeid
         self._name = name
+        if name == '':
+            name = type(self).__name__
+        # also needed for recursive types
+        if hasattr(loader, "types") and typeid not in loader.types:
+            loader.types[typeid] = self
         self._loader = loader
         self._fields = fields
-        self._class = collections.namedtuple(name, [n for (n, t) in fields])
+        if name.__contains__(' '):
+            name = type(self).__name__
+        self._class = collections.namedtuple(name, [n for (n, t) in fields], rename=True)
 
     def decode(self, buf):
         """Decode data from buf and return a namedtuple."""
@@ -372,6 +392,20 @@ class GoStruct(GoType):
             value, buf = self._loader.types[typeid].decode(buf)
             values[name] = value
         return self.zero._replace(**values), buf
+
+    def encode(self, values):
+        buf = bytearray()
+        delta = 1
+        for field, value in itertools.zip_longest(self._fields, values, fillvalue=None):
+            if value == None:
+                delta += 1
+                continue
+            buf.extend(GoUint.encode(delta))
+            field_type = self._loader.types[field[1]]
+            buf.extend(field_type.encode(value))
+            delta = 1
+        buf.extend(GoUint.encode(0))
+        return buf
 
     def __repr__(self):
         """GoStruct representation.
@@ -422,6 +456,21 @@ class GoWireType(GoStruct):
             elem_typeid = wire_type.MapT.Elem
             return GoMap(typeid, self._loader, key_typeid, elem_typeid), buf
 
+        if wire_type.GobEncoderT != self._loader.types[GOB_ENCODER_TYPE].zero:
+            typeid = wire_type.GobEncoderT.CommonType.Id
+            name = wire_type.GobEncoderT.CommonType.Name.decode('utf-8')
+            return GoGobEncoder(typeid, self._loader), buf
+
+        if wire_type.BinaryMarshalerT != self._loader.types[BINARY_MARSHALER_TYPE].zero:
+            typeid = wire_type.BinaryMarshalerT.GobEncoderT.CommonType.Id
+            name = wire_type.BinaryMarshalerT.GobEncoderT.CommonType.Name.decode('utf-8')
+            return GoBinaryMarshaler(typeid, self._loader), buf
+
+        if wire_type.TextMarshalerT != self._loader.types[TEXT_MARSHALER_TYPE].zero:
+            typeid = wire_type.TextMarshalerT.GobEncoderT.CommonType.Id
+            name = wire_type.TextMarshalerT.GobEncoderT.CommonType.Name.decode('utf-8')
+            return GoTextMarshaler(typeid, self._loader), buf
+
         raise NotImplementedError("cannot handle %s" % wire_type)
 
 
@@ -464,6 +513,14 @@ class GoArray(GoType):
             result.append(value)
         return tuple(result), buf
 
+    def encode(self, values):
+        buf = bytearray()
+        buf.extend(GoUint.encode(len(value)))
+        for value in values:
+            go_type = self._loader.python_types.get(type(value))
+            buf.extend(go_type.encode(value))
+        return buf
+
 
 class GoSlice(GoType):
     """A Go slice.
@@ -501,6 +558,14 @@ class GoSlice(GoType):
             result.append(value)
         return result, buf
 
+    def encode(self, value):
+        buf = bytearray()
+        buf.extend(GoUint.encode(len(value)))
+        for i in value:
+            go_type = self._loader.python_types.get(type(value))
+            buf.extend(go_type.encode(value))
+        return buf
+
 
 class GoMap(GoType):
     """A Go map.
@@ -535,3 +600,82 @@ class GoMap(GoType):
             value, buf = self._loader.decode_value(self._elem_typeid, buf)
             result[key] = value
         return result, buf
+
+    def encode(self, value):
+        buf = bytearray()
+        buf.extend(GoUint.encode(len(value)))
+        for i in value:
+            key_type = self._loader.python_types.get(type(i[0]))
+            value_type = self._loader.python_types.get(type(i[1]))
+            buf.extend(key_type.encode(i[0]))
+            buf.extend(value_type.encode([1]))
+        return buf
+
+
+class GoGobEncoder(GoType):
+    """A Go Gob Encoder.
+    """
+
+    @property
+    def zero(self):
+        return b''
+
+    def __init__(self, typeid, loader):
+        self.typeid = typeid
+        self._loader = loader
+
+    def decode(self, buf):
+        count, buf = GoUint.decode(buf)
+        return buf[:count], buf[count:]
+
+    def encode(self, value):
+        buf = bytearray()
+        buf.extend(GoUint.encode(len(value)))
+        buf.extend(value)
+        return buf
+
+
+class GoBinaryMarshaler(GoType):
+    """A Go Binary Marshaler
+    """
+
+    @property
+    def zero(self):
+        return b''
+
+    def __init__(self, typeid, loader):
+        self.typeid = typeid
+        self._loader = loader
+
+    def decode(self, buf):
+        count, buf = GoUint.decode(buf)
+        return buf[:count], buf[count:]
+
+    def encode(self, value):
+        buf = bytearray()
+        buf.extend(GoUint.encode(len(value)))
+        buf.extend(value)
+        return buf
+
+
+class GoTextMarshaler(GoType):
+    """A Go Text Marshaler
+    """
+
+    @property
+    def zero(self):
+        return b''
+
+    def __init__(self, typeid, loader):
+        self.typeid = typeid
+        self._loader = loader
+
+    def decode(self, buf):
+        count, buf = GoUint.decode(buf)
+        return buf[:count], buf[count:]
+
+    def encode(self, value):
+        buf = bytearray()
+        buf.extend(GoUint.encode(len(value)))
+        buf.extend(value)
+        return buf
